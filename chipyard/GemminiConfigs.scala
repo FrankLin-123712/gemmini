@@ -45,3 +45,17 @@ class GemminiShuttleConfig extends Config(
   new gemmini.DefaultGemminiConfig ++                            // use Gemmini systolic array GEMM accel
   new shuttle.common.WithNShuttleCores ++
   new chipyard.config.AbstractConfig)
+
+// ============= Our custom GemminiRocket chip config for running DPVO ===============
+class DPVOFP32Dim16GemminiRocketConfig extends Config(
+  new gemmini.GemminiCustomConfig ++
+  new freechips.rocketchip.rocket.WithNHugeCores(1) ++
+  new chipyard.config.WithSystemBusWidth(512) ++
+  new chipyard.config.AbstractConfig)
+
+class DPVOFP16Dim32GemminiRocketConfig extends Config(
+  new gemmini.GemminiCustomConfig(gemmini.GemminiCustomConfigs.dpvoFP16Dim32Config) ++
+  new freechips.rocketchip.rocket.WithNHugeCores(1) ++
+  new chipyard.config.WithSystemBusWidth(512) ++
+  new chipyard.config.AbstractConfig)
+// ============= Our custom GemminiRocket chip config for running DPVO ===============

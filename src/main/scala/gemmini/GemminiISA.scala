@@ -42,6 +42,7 @@ object GemminiISA {
   val CONFIG_EX = 0.U
   val CONFIG_LOAD = 1.U
   val CONFIG_STORE = 2.U
+  val CONFIG_IM2COL = 3.U
   val CONFIG_NORM = 3.U
 
   //==========================================================================
@@ -250,4 +251,3 @@ object GemminiISA {
     val local_addr = local_addr_t.cloneType
   }
 }
-

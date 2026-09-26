@@ -92,6 +92,7 @@ case class GemminiArrayConfig[T <: Data : Arithmetic, U <: Data, V <: Data](
                                                                              has_normalizations: Boolean = false,
                                                                              has_first_layer_optimizations: Boolean = true,
                                                                              has_loop_conv: Boolean = true,
+                                                                             has_im2col: Boolean = false,
 
                                                                              use_firesim_simulation_counters: Boolean = false,
 
@@ -177,7 +178,7 @@ case class GemminiArrayConfig[T <: Data : Arithmetic, U <: Data, V <: Data](
 
   val pixel_repeats_bits = 8 min log2Up(meshColumns * tileColumns + 1)
 
-  val hasIm2Col = false
+  val hasIm2Col = has_im2col
 
   val tree_reduction = use_tree_reduction_if_possible && dataflow == Dataflow.WS && tileRows > 1
 
@@ -497,6 +498,10 @@ case class GemminiArrayConfig[T <: Data : Arithmetic, U <: Data, V <: Data](
 
     if (has_first_layer_optimizations) {
       header ++= "#define HAS_FIRST_LAYER_OPTIMIZATIONS\n\n"
+    }
+
+    if (hasIm2Col) {
+      header ++= "#define HAS_IM2COL\n\n"
     }
 
     if (has_normalizations) {
