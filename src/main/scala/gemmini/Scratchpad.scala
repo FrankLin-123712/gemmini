@@ -232,6 +232,18 @@ class Scratchpad[T <: Data, U <: Data, V <: Data](config: GemminiArrayConfig[T, 
         val write = Flipped(new ScratchpadWriteMemIO(local_addr_t, accType.getWidth, acc_scale_t_bits))
       }
 
+      // Exclusive gather client shares the existing reader/TLB, bypassing scaling.
+      val corr = if (config.has_corr_gather) Some(new Bundle {
+        val active = Input(Bool())
+        val cancel = Input(Bool())
+        val status = Input(new MStatus)
+        val readReq = Flipped(Decoupled(new CorrelationGatherReadRequest(coreMaxAddrBits)))
+        val readResp = Decoupled(new CorrelationGatherReadResponse)
+        val write = Flipped(Decoupled(new CorrelationGatherWrite(log2Ceil(sp_banks * sp_bank_entries))))
+        val memoryBusy = Output(Bool())
+        val fault = Output(Bool())
+      }) else None
+
       // SRAM ports
       val srams = new Bundle {
         val read = Flipped(Vec(sp_banks, new ScratchpadReadIO(sp_bank_entries, spad_w)))
@@ -404,6 +416,33 @@ class Scratchpad[T <: Data, U <: Data, V <: Data](config: GemminiArrayConfig[T, 
     reader.module.io.req.bits.status := read_issue_q.io.deq.bits.status
     reader.module.io.req.bits.cmd_id := read_issue_q.io.deq.bits.cmd_id
 
+    val corrActive = io.corr.map(_.active).getOrElse(false.B)
+    reader.module.io.gather := corrActive
+    reader.module.io.cancel := io.corr.map(_.cancel).getOrElse(false.B)
+    io.corr.foreach { c =>
+      c.readReq.ready := corrActive && reader.module.io.req.ready
+      c.memoryBusy := reader.module.io.busy
+      c.fault := reader.module.io.fault
+      c.write.ready := false.B
+      c.readResp.valid := corrActive && reader.module.io.resp.valid
+      c.readResp.bits.token := reader.module.io.resp.bits.addr
+      c.readResp.bits.data := reader.module.io.resp.bits.data
+      c.readResp.bits.mask := reader.module.io.resp.bits.mask.asUInt
+      c.readResp.bits.bytesRead := reader.module.io.resp.bits.bytes_read
+      when (corrActive) {
+        assert(!read_issue_q.io.deq.valid, "normal mvin must drain before correlation gather")
+        read_issue_q.io.deq.ready := false.B
+        reader.module.io.req.valid := c.readReq.valid
+        reader.module.io.req.bits := 0.U.asTypeOf(reader.module.io.req.bits)
+        reader.module.io.req.bits.vaddr := c.readReq.bits.addr
+        // The exclusive client uses the local-address field as a response token.
+        reader.module.io.req.bits.spaddr := c.readReq.bits.token
+        reader.module.io.req.bits.len := c.readReq.bits.bytes >> 2
+        reader.module.io.req.bits.pixel_repeats := 1.U
+        reader.module.io.req.bits.status := c.status
+      }
+    }
+
     val (mvin_scale_in, mvin_scale_out) = VectorScalarMultiplier(
       config.mvin_scale_args,
       config.inputType, config.meshColumns * config.tileColumns, chiselTypeOf(reader.module.io.resp.bits),
@@ -417,7 +456,7 @@ class Scratchpad[T <: Data, U <: Data, V <: Data](config: GemminiArrayConfig[T, 
       )
     )
 
-    mvin_scale_in.valid := reader.module.io.resp.valid && (mvin_scale_shared.B || !reader.module.io.resp.bits.is_acc ||
+    mvin_scale_in.valid := reader.module.io.resp.valid && !corrActive && (mvin_scale_shared.B || !reader.module.io.resp.bits.is_acc ||
       (reader.module.io.resp.bits.is_acc && !reader.module.io.resp.bits.has_acc_bitwidth))
 
     mvin_scale_in.bits.in := reader.module.io.resp.bits.data.asTypeOf(chiselTypeOf(mvin_scale_in.bits.in))
@@ -441,7 +480,7 @@ class Scratchpad[T <: Data, U <: Data, V <: Data](config: GemminiArrayConfig[T, 
     mvin_scale_pixel_repeater.io.resp.ready := false.B
 
     if (!mvin_scale_shared) {
-      mvin_scale_acc_in.valid := reader.module.io.resp.valid &&
+      mvin_scale_acc_in.valid := reader.module.io.resp.valid && !corrActive &&
         (reader.module.io.resp.bits.is_acc && reader.module.io.resp.bits.has_acc_bitwidth)
       mvin_scale_acc_in.bits.in := reader.module.io.resp.bits.data.asTypeOf(chiselTypeOf(mvin_scale_acc_in.bits.in))
       mvin_scale_acc_in.bits.scale := reader.module.io.resp.bits.scale.asTypeOf(mvin_scale_acc_t)
@@ -455,6 +494,10 @@ class Scratchpad[T <: Data, U <: Data, V <: Data](config: GemminiArrayConfig[T, 
 
     reader.module.io.resp.ready := Mux(reader.module.io.resp.bits.is_acc && reader.module.io.resp.bits.has_acc_bitwidth,
       mvin_scale_acc_in.ready, mvin_scale_in.ready)
+
+    io.corr.foreach { c =>
+      when (corrActive) { reader.module.io.resp.ready := c.readResp.ready }
+    }
 
     val mvin_scale_finished = mvin_scale_pixel_repeater.io.resp.fire && mvin_scale_pixel_repeater.io.resp.bits.last
     val mvin_scale_acc_finished = mvin_scale_acc_out.fire && mvin_scale_acc_out.bits.last
@@ -492,7 +535,7 @@ class Scratchpad[T <: Data, U <: Data, V <: Data](config: GemminiArrayConfig[T, 
     reader.module.io.flush := io.flush
 
     io.busy := writer.module.io.busy || spad_writer.map(_.module.io.busy).getOrElse(false.B) || reader.module.io.busy ||
-      write_issue_q.io.deq.valid || write_norm_q.io.deq.valid || write_scale_q.io.deq.valid || write_dispatch_q.valid
+      read_issue_q.io.deq.valid || write_issue_q.io.deq.valid || write_norm_q.io.deq.valid || write_scale_q.io.deq.valid || write_dispatch_q.valid
 
     val spad_mems = {
       val banks = Seq.fill(sp_banks) { Module(new ScratchpadBank(
@@ -608,6 +651,17 @@ class Scratchpad[T <: Data, U <: Data, V <: Data](config: GemminiArrayConfig[T, 
           bio.write.addr := DontCare
           bio.write.data := DontCare
           bio.write.mask := DontCare
+        }
+        io.corr.foreach { c =>
+          val selected = (c.write.bits.addr / sp_bank_entries.U) === i.U
+          when (corrActive && selected) {
+            assert(!exwrite && !dmaread && !zerowrite, "gather requires exclusive SPAD ownership")
+            c.write.ready := bio.write.ready
+            bio.write.valid := c.write.valid
+            bio.write.addr := c.write.bits.addr % sp_bank_entries.U
+            bio.write.data := c.write.bits.data
+            bio.write.mask := VecInit(Seq.fill(spad_w / (aligned_to * 8))(true.B))
+          }
         }
       }
       banks

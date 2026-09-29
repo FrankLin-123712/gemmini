@@ -162,7 +162,13 @@ class GemminiModule[T <: Data: Arithmetic, U <: Data, V <: Data]
 
   // Counters
   val counters = Module(new CounterController(outer.config.num_counter, outer.xLen))
-  io.resp <> counters.io.out  // Counter access command will be committed immediately
+  val corrResponse = Module(new Queue(new RoCCResponse, 1))
+  corrResponse.io.enq.valid := false.B
+  corrResponse.io.enq.bits := DontCare
+  val responseArb = Module(new RRArbiter(new RoCCResponse, 2))
+  responseArb.io.in(0) <> counters.io.out
+  responseArb.io.in(1) <> corrResponse.io.deq
+  io.resp <> responseArb.io.out
   counters.io.event_io.external_values(0) := 0.U
   counters.io.event_io.event_signal(0) := false.B
   counters.io.in.valid := false.B
@@ -242,7 +248,17 @@ class GemminiModule[T <: Data: Arithmetic, U <: Data, V <: Data]
   raw_cmd_q.io.enq.bits.from_conv_fsm := false.B
   raw_cmd_q.io.enq.bits.from_matmul_fsm := false.B
 
-  val raw_cmd = raw_cmd_q.io.deq
+  val incoming_cmd = raw_cmd_q.io.deq
+  val raw_cmd = Wire(Decoupled(new GemminiCmd(reservation_station_entries)))
+  raw_cmd <> incoming_cmd
+  val corrBusy = WireInit(false.B)
+  val corrError = WireInit(false.B)
+  val corrStats = WireInit(0.U.asTypeOf(new CorrelationGatherStats))
+  val corrFunct = incoming_cmd.bits.cmd.inst.funct
+  val isCorr = corrFunct >= CORR_CONFIG_GEOM && corrFunct <= CORR_STATUS
+  val corrFlush = corrBusy && corrFunct === FLUSH_CMD
+  raw_cmd.valid := incoming_cmd.valid && !isCorr && !corrBusy
+  when (isCorr || corrBusy) { incoming_cmd.ready := false.B }
 
   val max_lds = reservation_station_entries_ld
   val max_exs = reservation_station_entries_ex
@@ -440,7 +456,100 @@ class GemminiModule[T <: Data: Arithmetic, U <: Data, V <: Data]
   reservation_station_completed_arb.io.out.ready := true.B
 
   // Wire up global RoCC signals
-  io.busy := raw_cmd.valid || loop_conv_unroller_busy || loop_matmul_unroller_busy || reservation_station.io.busy || spad.module.io.busy || unrolled_cmd.valid || loop_cmd.valid || conv_cmd.valid
+  val normalBusy = loop_conv_unroller_busy || loop_matmul_unroller_busy ||
+    reservation_station.io.busy || spad.module.io.busy || unrolled_cmd.valid || loop_cmd.valid ||
+    conv_cmd.valid || load_controller.io.busy || store_controller.io.busy || ex_controller.io.busy
+  io.busy := incoming_cmd.valid || normalBusy || corrBusy || corrResponse.io.deq.valid
+
+  // Consume the gather ABI before the loop unrollers / reservation station.
+  // Do not include the held CORR command itself in normalBusy: that deadlocks.
+  if (outer.config.has_corr_gather) {
+    require(xLen == 64, "correlation gather ABI requires RV64")
+    val engine = withClock(gated_clock) {
+      Module(new CorrelationGatherController(coreMaxAddrBits, log2Ceil(sp_banks * sp_bank_entries)))
+    }
+    val descriptor = RegInit(0.U.asTypeOf(engine.io.start.bits))
+    val configured = RegInit(0.U(3.W))
+    val memoryStatus = Reg(new freechips.rocketchip.rocket.MStatus)
+    val aborting = RegInit(false.B)
+    val c = spad.module.io.corr.get
+    corrBusy := engine.io.busy
+    corrError := engine.io.error
+    corrStats := engine.io.stats
+    c.active := engine.io.busy
+    c.cancel := aborting && engine.io.busy
+    c.status := memoryStatus
+    c.readReq <> engine.io.readReq
+    engine.io.readResp <> c.readResp
+    c.write <> engine.io.write
+    engine.io.memoryBusy := c.memoryBusy
+    engine.io.abort := aborting
+    when (!engine.io.busy) { aborting := false.B }
+    when (engine.io.busy && (c.fault || io.interrupt)) { aborting := true.B }
+
+    engine.io.start.valid := incoming_cmd.valid && corrFunct === CORR_GATHER && !normalBusy
+    engine.io.start.bits := descriptor
+    engine.io.start.bits.bBase := incoming_cmd.bits.cmd.rs1
+    // Reserved bits, an oversized local address, or incomplete configuration
+    // produce the same sticky error as an invalid descriptor, without memory IO.
+    when (configured =/= 7.U || incoming_cmd.bits.cmd.rs2 =/= 0.U ||
+      (incoming_cmd.bits.cmd.rs1 >> log2Ceil(sp_banks * sp_bank_entries)) =/= 0.U) {
+      engine.io.start.bits.heights(0) := 0.U
+    }
+    when (incoming_cmd.valid && isCorr && corrFunct =/= CORR_STATUS && !engine.io.busy && !normalBusy) {
+      incoming_cmd.ready := Mux(corrFunct === CORR_GATHER, engine.io.start.ready, true.B)
+      when (incoming_cmd.fire) {
+        switch (corrFunct) {
+          is (CORR_CONFIG_GEOM) {
+            descriptor.widths(0) := incoming_cmd.bits.cmd.rs1(31, 0)
+            descriptor.heights(0) := incoming_cmd.bits.cmd.rs1(63, 32)
+            descriptor.widths(1) := incoming_cmd.bits.cmd.rs2(31, 0)
+            descriptor.heights(1) := incoming_cmd.bits.cmd.rs2(63, 32)
+            configured := configured | 1.U
+          }
+          is (CORR_CONFIG_BASES) {
+            descriptor.bases(0) := incoming_cmd.bits.cmd.rs1
+            descriptor.bases(1) := incoming_cmd.bits.cmd.rs2
+            configured := configured | 2.U
+          }
+          is (CORR_CONFIG_ORIGINS) {
+            descriptor.originX(0) := incoming_cmd.bits.cmd.rs1(31, 0).asSInt
+            descriptor.originY(0) := incoming_cmd.bits.cmd.rs1(63, 32).asSInt
+            descriptor.originX(1) := incoming_cmd.bits.cmd.rs2(31, 0).asSInt
+            descriptor.originY(1) := incoming_cmd.bits.cmd.rs2(63, 32).asSInt
+            configured := configured | 4.U
+          }
+          is (CORR_GATHER) { memoryStatus := incoming_cmd.bits.cmd.status }
+        }
+      }
+    }
+    // Flush cannot sit behind a busy gather in the unroller. Both variants abort
+    // this partial B, drain the reader, and require software to resubmit the job.
+    when (incoming_cmd.valid && corrFlush) {
+      incoming_cmd.ready := true.B
+      aborting := true.B
+      tlb.io.exp.foreach(_.flush_skip := incoming_cmd.bits.cmd.rs1(0))
+      tlb.io.exp.foreach(_.flush_retry := !incoming_cmd.bits.cmd.rs1(0))
+    }
+  } else {
+    val unsupported = RegInit(false.B)
+    corrError := unsupported
+    when (incoming_cmd.valid && isCorr && corrFunct =/= CORR_STATUS && !normalBusy) {
+      incoming_cmd.ready := true.B
+      unsupported := true.B
+    }
+  }
+  when (incoming_cmd.valid && corrFunct === CORR_STATUS) {
+    incoming_cmd.ready := corrResponse.io.enq.ready
+    corrResponse.io.enq.valid := true.B
+    corrResponse.io.enq.bits.rd := incoming_cmd.bits.cmd.inst.rd
+    val status = "h4347523100000000".U(64.W) |
+      (outer.config.has_corr_gather.B.asUInt << 2) | (corrBusy.asUInt << 1) | corrError.asUInt
+    corrResponse.io.enq.bits.data := MuxLookup(incoming_cmd.bits.cmd.rs1, 0.U)(Seq(
+      0.U -> status, 1.U -> corrStats.cycles, 2.U -> corrStats.usefulBytes,
+      3.U -> corrStats.strips, 4.U -> corrStats.rows,
+      5.U -> corrStats.readStall, 6.U -> corrStats.writeStall))
+  }
 
   io.interrupt := tlb.io.exp.map(_.interrupt).reduce(_ || _)
 

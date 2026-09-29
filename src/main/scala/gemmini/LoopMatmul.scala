@@ -832,6 +832,7 @@ class LoopMatmulState(val iterator_bitwidth: Int, val coreMaxAddrBits: Int, val 
   val c_spad_addr = UInt(max_acc_addr.W)
   val inc_acc_addr = Bool()
   val spad_only = Bool()
+  val restore_spad_defaults = Bool()
 
   val a_transpose = Bool()
   val b_transpose = Bool()
@@ -884,6 +885,7 @@ class LoopMatmulState(val iterator_bitwidth: Int, val coreMaxAddrBits: Int, val 
     st_completed := false.B
 
     spad_only := false.B
+    restore_spad_defaults := false.B
 
     //is_resadd := false.B
   }
@@ -1095,6 +1097,7 @@ class LoopMatmul(block_size: Int, coreMaxAddrBits: Int, reservation_station_size
         loop_being_configured.st_completed := cmd.bits.cmd.rs2(7)
         loop_being_configured.inc_acc_addr := cmd.bits.cmd.rs2(8)
         loop_being_configured.spad_only := cmd.bits.cmd.rs2(9)
+        loop_being_configured.restore_spad_defaults := cmd.bits.cmd.rs2(10)
 
         loop_being_configured.c_spad_addr := cmd.bits.cmd.rs2(63, 32)
 
@@ -1285,6 +1288,12 @@ class LoopMatmul(block_size: Int, coreMaxAddrBits: Int, reservation_station_size
 
   when (head_loop.running && head_loop.all_completed()) {
     head_loop.reset()
+    // Direct-SPAD clients can make funct24 addresses one-shot. Ordinary commands
+    // retain their existing persistent-address semantics (rs2 bit10 is zero).
+    when (head_loop.restore_spad_defaults) {
+      head_loop.a_addr_start := head_loop_id * (max_addr / concurrent_loops).U
+      head_loop.b_addr_end := (head_loop_id +& 1.U) * (max_addr / concurrent_loops).U
+    }
     io.completed(head_loop_id) := true.B
     head_loop_id := ~head_loop_id
   }

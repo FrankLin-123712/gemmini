@@ -126,6 +126,11 @@ object GemminiCustomConfigs {
     headerFileName = "gemmini_params_dpvo_dim16.h"
   )
 
+  val dpvoFP32Dim16CorrGatherConfig = dpvoFP32Dim16Config.copy(
+    has_corr_gather = true,
+    headerFileName = "gemmini_params_dpvo_fp32_dim16_corr_gather.h"
+  )
+
   val dpvoFP16Dim32Config = GemminiFPConfigs.FP16DefaultConfig.copy(
     // array
     tileRows = 1,

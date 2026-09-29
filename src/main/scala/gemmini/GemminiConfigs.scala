@@ -93,6 +93,7 @@ case class GemminiArrayConfig[T <: Data : Arithmetic, U <: Data, V <: Data](
                                                                              has_first_layer_optimizations: Boolean = true,
                                                                              has_loop_conv: Boolean = true,
                                                                              has_im2col: Boolean = false,
+                                                                             has_corr_gather: Boolean = false,
 
                                                                              use_firesim_simulation_counters: Boolean = false,
 
@@ -114,6 +115,13 @@ case class GemminiArrayConfig[T <: Data : Arithmetic, U <: Data, V <: Data](
     case CapacityInMatrices(ms) => ms * meshRows * tileRows / acc_banks
   }
   require (!acc_singleported || (acc_sub_banks <= 4 && isPow2(acc_sub_banks)))
+
+  // Phase 1 is deliberately tied to the FP32 DIM16 WS memory contract.
+  require(!has_corr_gather || (inputType.isInstanceOf[Float] && inputType.getWidth == 32 &&
+    accType.getWidth == 32 && tileRows == 1 && tileColumns == 1 && meshRows == 16 && meshColumns == 16 &&
+    dataflow == Dataflow.WS && sp_banks == 4 && sp_bank_entries == 1024 &&
+    aligned_to == 1 && dma_buswidth == 512 && dma_maxbytes == 64 &&
+    !use_shared_ext_mem && !use_tl_ext_mem), "correlation gather requires the DPVO FP32 DIM16 WS configuration")
 
   val local_addr_t = new LocalAddr(sp_banks, sp_bank_entries, acc_banks, acc_bank_entries)
 
@@ -344,6 +352,7 @@ case class GemminiArrayConfig[T <: Data : Arithmetic, U <: Data, V <: Data](
 
     header ++= s"#define DIM ${tileColumns*meshColumns}\n"
     header ++= s"#define ADDR_LEN 32\n"
+    header ++= s"#define HAS_CORR_GATHER ${if (has_corr_gather) 1 else 0}\n"
     header ++= s"#define BANK_NUM $sp_banks\n"
     header ++= s"#define BANK_ROWS $sp_bank_entries\n"
     header ++= s"#define ACC_ROWS ${acc_banks * acc_bank_entries}\n" // TODO add ACC_BANKS as well

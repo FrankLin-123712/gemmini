@@ -14,7 +14,7 @@ object GemminiISA {
   val PRELOAD_CMD = 6.U
   val FLUSH_CMD = 7.U
 
-  val LOOP_WS = 8.U
+  val LOOP_WS = 8.U // rs2[10]: restore this loop slot's default SPAD A/B addresses on completion
   val LOOP_WS_CONFIG_BOUNDS = 9.U
   val LOOP_WS_CONFIG_ADDRS_AB = 10.U
   val LOOP_WS_CONFIG_ADDRS_DC = 11.U
@@ -37,6 +37,13 @@ object GemminiISA {
   val STORE_SPAD_CMD = 23.U
   val LOOP_WS_CONFIG_SPAD_AB = 24.U
   val LOOP_WS_CONFIG_SPAD_C = 25.U
+
+  // Correlation gather ABI v1 (FP32 DIM16 opt-in configuration).
+  val CORR_CONFIG_GEOM = 40.U
+  val CORR_CONFIG_BASES = 41.U
+  val CORR_CONFIG_ORIGINS = 42.U
+  val CORR_GATHER = 43.U
+  val CORR_STATUS = 44.U
 
   // rs1[2:0] values
   val CONFIG_EX = 0.U

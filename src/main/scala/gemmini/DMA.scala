@@ -64,6 +64,9 @@ class StreamReader[T <: Data, U <: Data, V <: Data](config: GemminiArrayConfig[T
       val resp = Decoupled(new StreamReadResponse(spadWidth, accWidth, spad_rows, acc_rows, aligned_to, config.mvin_scale_t_bits))
       val tlb = new FrontendTLBIO
       val busy = Output(Bool())
+      val gather = Input(Bool())
+      val cancel = Input(Bool()) // gather-only abort; drain reserved and issued reads
+      val fault = Output(Bool())
       val flush = Input(Bool())
 
       val counter = new CounterEventIO()
@@ -77,7 +80,10 @@ class StreamReader[T <: Data, U <: Data, V <: Data](config: GemminiArrayConfig[T
 
     core.module.io.req <> io.req
     io.tlb <> core.module.io.tlb
-    io.busy := xactTracker.io.busy
+    io.busy := xactTracker.io.busy || core.module.io.busy || beatPacker.io.busy
+    core.module.io.gather := io.gather
+    core.module.io.cancel := io.cancel
+    io.fault := core.module.io.fault
     core.module.io.flush := io.flush
 
     xactTracker.io.alloc <> core.module.io.reserve
@@ -146,9 +152,13 @@ class StreamReaderCore[T <: Data, U <: Data, V <: Data](config: GemminiArrayConf
 
     val io = IO(new Bundle {
       val req = Flipped(Decoupled(new StreamReadRequest(spad_rows, acc_rows, config.mvin_scale_t_bits)))
+      val busy = Output(Bool())
       val reserve = new XactTrackerAllocIO(nXacts, maxBytes, spadWidth, accWidth, spad_rows, acc_rows, maxBytes, config.mvin_scale_t_bits, nCmds)
       val beatData = Decoupled(new StreamReadBeat(nXacts, beatBits, maxBytes))
       val tlb = new FrontendTLBIO
+      val gather = Input(Bool())
+      val cancel = Input(Bool()) // gather-only abort; drain reserved and issued reads
+      val fault = Output(Bool())
       val flush = Input(Bool())
       val counter = new CounterEventIO()
     })
@@ -163,7 +173,7 @@ class StreamReaderCore[T <: Data, U <: Data, V <: Data](config: GemminiArrayConf
     val bytesLeft = Mux(req.has_acc_bitwidth, req.len * (config.accType.getWidth / 8).U, req.len * (config.inputType.getWidth / 8).U) - bytesRequested
 
     val state_machine_ready_for_req = WireInit(state === s_idle)
-    io.req.ready := state_machine_ready_for_req
+    io.req.ready := state_machine_ready_for_req && !io.cancel
 
     // Select the size and mask of the TileLink request
     class Packet extends Bundle {
@@ -216,7 +226,7 @@ class StreamReaderCore[T <: Data, U <: Data, V <: Data](config: GemminiArrayConf
     }
 
     val untranslated_a = Wire(Decoupled(new TLBundleAWithInfo))
-    untranslated_a.valid := state === s_req_new_block && io.reserve.ready
+    untranslated_a.valid := state === s_req_new_block && io.reserve.ready && !io.cancel
     untranslated_a.bits.tl_a := get
     untranslated_a.bits.vaddr := read_vaddr
     untranslated_a.bits.status := req.status
@@ -230,7 +240,7 @@ class StreamReaderCore[T <: Data, U <: Data, V <: Data](config: GemminiArrayConf
     val tlb_q = Module(new Queue(new TLBundleAWithInfo, 1, pipe=true))
     tlb_q.io.enq <> tlb_arb.io.out
 
-    io.tlb.req.valid := tlb_q.io.deq.valid
+    io.tlb.req.valid := tlb_q.io.deq.valid && !io.cancel
     io.tlb.req.bits := DontCare
     io.tlb.req.bits.tlb_req.vaddr := tlb_q.io.deq.bits.vaddr
     io.tlb.req.bits.tlb_req.passthrough := false.B
@@ -240,17 +250,28 @@ class StreamReaderCore[T <: Data, U <: Data, V <: Data](config: GemminiArrayConf
 
     val translate_q = Module(new Queue(new TLBundleAWithInfo, 1, pipe=true))
     translate_q.io.enq <> tlb_q.io.deq
-    translate_q.io.deq.ready := true.B
+    // Cancel only unpublished requests. Their tracker slots must still be retired;
+    // the single-beat synthetic response below goes through the normal merger.
+    // Already-published TileLink reads are drained normally.
+    val cancelPending = config.has_corr_gather.B && io.cancel && translate_q.io.deq.valid
+    translate_q.io.deq.ready := !io.cancel || (!tl.d.valid && io.beatData.ready)
+    io.busy := state =/= s_idle || tlb_q.io.deq.valid || translate_q.io.deq.valid
+    val translationFault = translate_q.io.deq.valid && !io.tlb.resp.miss &&
+      (io.tlb.resp.pf.ld || io.tlb.resp.ae.ld)
+    io.fault := io.gather && (translationFault ||
+      (tl.d.fire && (tl.d.bits.denied || tl.d.bits.corrupt)))
+    val blockFault = io.gather && translationFault
 
-    retry_a.valid := translate_q.io.deq.valid && (io.tlb.resp.miss || !tl.a.ready)
+
+    retry_a.valid := translate_q.io.deq.valid && !io.cancel && (io.tlb.resp.miss || !tl.a.ready || blockFault)
     retry_a.bits := translate_q.io.deq.bits
-    assert(retry_a.ready)
+    when (retry_a.valid) { assert(retry_a.ready) }
 
-    tl.a.valid := translate_q.io.deq.valid && !io.tlb.resp.miss
+    tl.a.valid := translate_q.io.deq.valid && !io.tlb.resp.miss && !blockFault && !io.cancel
     tl.a.bits := translate_q.io.deq.bits.tl_a
     tl.a.bits.address := io.tlb.resp.paddr
 
-    io.reserve.valid := state === s_req_new_block && untranslated_a.ready // TODO decouple "reserve.valid" from "tl.a.ready"
+    io.reserve.valid := state === s_req_new_block && untranslated_a.ready && !io.cancel // TODO decouple "reserve.valid" from "tl.a.ready"
     io.reserve.entry.shift := read_shift
     io.reserve.entry.is_acc := req.is_acc
     io.reserve.entry.accumulate := req.accumulate
@@ -290,11 +311,18 @@ class StreamReaderCore[T <: Data, U <: Data, V <: Data](config: GemminiArrayConf
 
     // Forward TileLink read responses to the reservation buffer
     tl.d.ready := io.beatData.ready
-    io.beatData.valid := tl.d.valid
+    io.beatData.valid := tl.d.valid || cancelPending
     io.beatData.bits.xactid := tl.d.bits.source
     io.beatData.bits.data := tl.d.bits.data
     io.beatData.bits.lg_len_req := tl.d.bits.size
     io.beatData.bits.last := edge.last(tl.d)
+    when (!tl.d.valid && cancelPending) {
+      io.beatData.bits.xactid := translate_q.io.deq.bits.tl_a.source
+      io.beatData.bits.data := 0.U
+      io.beatData.bits.lg_len_req := translate_q.io.deq.bits.tl_a.size
+      io.beatData.bits.last := true.B
+    }
+    when (io.cancel) { state := s_idle }
     // TODO the size data is already returned from TileLink, so there's no need for us to store it in the XactTracker ourselves
 
     // Accepting requests to kick-start the state machine

@@ -53,6 +53,12 @@ class DPVOFP32Dim16GemminiRocketConfig extends Config(
   new chipyard.config.WithSystemBusWidth(512) ++
   new chipyard.config.AbstractConfig)
 
+class DPVOFP32Dim16CorrGatherGemminiRocketConfig extends Config(
+  new gemmini.GemminiCustomConfig(gemmini.GemminiCustomConfigs.dpvoFP32Dim16CorrGatherConfig) ++
+  new freechips.rocketchip.rocket.WithNHugeCores(1) ++
+  new chipyard.config.WithSystemBusWidth(512) ++
+  new chipyard.config.AbstractConfig)
+
 class DPVOFP16Dim32GemminiRocketConfig extends Config(
   new gemmini.GemminiCustomConfig(gemmini.GemminiCustomConfigs.dpvoFP16Dim32Config) ++
   new freechips.rocketchip.rocket.WithNHugeCores(1) ++
