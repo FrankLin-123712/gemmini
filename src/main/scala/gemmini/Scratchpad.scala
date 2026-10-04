@@ -534,7 +534,8 @@ class Scratchpad[T <: Data, U <: Data, V <: Data](config: GemminiArrayConfig[T, 
     writer.module.io.flush := io.flush
     reader.module.io.flush := io.flush
 
-    io.busy := writer.module.io.busy || spad_writer.map(_.module.io.busy).getOrElse(false.B) || reader.module.io.busy ||
+    val nhwc_norm_busy = WireDefault(false.B)
+    io.busy := nhwc_norm_busy || writer.module.io.busy || spad_writer.map(_.module.io.busy).getOrElse(false.B) || reader.module.io.busy ||
       read_issue_q.io.deq.valid || write_issue_q.io.deq.valid || write_norm_q.io.deq.valid || write_scale_q.io.deq.valid || write_dispatch_q.valid
 
     val spad_mems = {
@@ -670,7 +671,11 @@ class Scratchpad[T <: Data, U <: Data, V <: Data](config: GemminiArrayConfig[T, 
     val acc_row_t = Vec(meshColumns, Vec(tileColumns, accType))
     val spad_row_t = Vec(meshColumns, Vec(tileColumns, inputType))
 
-    val (acc_norm_unit_in, acc_norm_unit_out) = Normalizer(
+    val (acc_norm_unit_in, acc_norm_unit_out) = if (config.has_nhwc_norm) {
+      val norm = Module(new NhwcNormalizer(block_cols, acc_row_t, acc_scale_t))
+      nhwc_norm_busy := norm.io.busy
+      (norm.io.in, norm.io.out)
+    } else Normalizer(
       is_passthru = !config.has_normalizations,
       max_len = block_cols,
       num_reduce_lanes = -1,
@@ -818,7 +823,11 @@ class Scratchpad[T <: Data, U <: Data, V <: Data](config: GemminiArrayConfig[T, 
           bio.read.resp.ready := true.B
 
           // Some normalizer commands don't write to main memory, so they don't need to be passed on to the scaling units
-          write_scale_q.io.enq.valid := NormCmd.writes_to_main_memory(write_norm_q.io.deq.bits.laddr.norm_cmd)
+          val is_nhwc_norm = config.has_nhwc_norm.B &&
+            Activation.isNhwcNorm(write_norm_q.io.deq.bits.acc_act)
+          write_scale_q.io.enq.valid := Mux(is_nhwc_norm,
+            NormCmd.nhwc_writes_to_main_memory(write_norm_q.io.deq.bits.laddr.norm_cmd),
+            NormCmd.writes_to_main_memory(write_norm_q.io.deq.bits.laddr.norm_cmd))
 
           acc_norm_unit_in.bits.acc_read_resp := bio.read.resp.bits
           acc_norm_unit_in.bits.acc_read_resp.acc_bank_id := i.U

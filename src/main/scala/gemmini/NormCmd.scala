@@ -11,6 +11,12 @@ object NormCmd extends ChiselEnum {
     cmd === RESET
   }
 
+  // In the NHWC ABI, MEAN and INV_STDDEV export raw vector sums. The CPU
+  // divides by the spatial count and computes sqrt(var + epsilon).
+  def nhwc_writes_to_main_memory(cmd: Type): Bool = {
+    cmd === RESET || cmd === MEAN || cmd === INV_STDDEV
+  }
+
   def non_reset_version(cmd: Type): Type = {
     MuxCase(cmd, Seq(
       (cmd === MEAN) -> SUM,

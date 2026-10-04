@@ -136,7 +136,8 @@ class StoreController[T <: Data : Arithmetic, U <: Data, V <: Data](config: Gemm
   val pool_vaddr = vaddr + (porow_counter * pool_out_dim + pocol_counter) * stride // TODO get rid of these multiplications
 
   val DoConfig = cmd.bits.cmd.inst.funct === CONFIG_CMD && config_cmd_type === CONFIG_STORE
-  val DoConfigNorm = config.has_normalizations.B && cmd.bits.cmd.inst.funct === CONFIG_CMD && config_cmd_type === CONFIG_NORM
+  val hasNormConfig = config.has_normalizations || config.has_nhwc_norm
+  val DoConfigNorm = hasNormConfig.B && cmd.bits.cmd.inst.funct === CONFIG_CMD && config_cmd_type === CONFIG_NORM
   val DoStore = !DoConfig && !DoConfigNorm
 
   cmd.ready := false.B
@@ -224,6 +225,13 @@ class StoreController[T <: Data : Arithmetic, U <: Data, V <: Data](config: Gemm
 
     assert(!(io.dma.req.bits.laddr.read_full_acc_row && blocks > 1.U), "Block-mvouts are not permitted when moving out full accumulator data")
     assert(!((pooling_is_enabled || mvout_1d_enabled) && blocks > 1.U), "Block-mvouts are not permitted when pooling")
+    if (config.has_nhwc_norm) {
+      when (Activation.isNhwcNorm(activation)) {
+        assert(!pooling_is_enabled && !mvout_1d_enabled && blocks === 1.U &&
+          rows > 0.U && rows <= block_rows.U && !io.dma.req.bits.laddr.read_full_acc_row,
+          "NHWC normalization requires unpooled, small-width accumulator rows with rows/cols <= DIM")
+      }
+    }
   }
 
   // Control logic
@@ -255,7 +263,10 @@ class StoreController[T <: Data : Arithmetic, U <: Data, V <: Data](config: Gemm
           }
           cmd.ready := true.B
         }
-        .elsewhen(config.has_normalizations.B && DoConfigNorm) {
+        .elsewhen(DoConfigNorm) {
+          if (config.has_nhwc_norm) {
+            assert(config_stats_id < 4.U, "NHWC normalization has four statistics contexts")
+          }
           when (!config_set_stats_id_only.asBool) {
             igelu_qb := config_igelu_qb.asTypeOf(igelu_qb)
             igelu_qc := config_igelu_qc.asTypeOf(igelu_qc)
@@ -309,7 +320,7 @@ class StoreController[T <: Data : Arithmetic, U <: Data, V <: Data](config: Gemm
   }
 
   // Optimizations when features are disabled
-  if (!config.has_normalizations) {
+  if (!hasNormConfig) {
     current_localaddr.norm_cmd := NormCmd.RESET
 
     igelu_qb := DontCare

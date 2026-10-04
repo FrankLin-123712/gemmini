@@ -90,6 +90,7 @@ case class GemminiArrayConfig[T <: Data : Arithmetic, U <: Data, V <: Data](
                                                                              has_nonlinear_activations: Boolean = true,
                                                                              has_dw_convs: Boolean = true,
                                                                              has_normalizations: Boolean = false,
+                                                                             has_nhwc_norm: Boolean = false,
                                                                              has_first_layer_optimizations: Boolean = true,
                                                                              has_loop_conv: Boolean = true,
                                                                              has_im2col: Boolean = false,
@@ -105,6 +106,14 @@ case class GemminiArrayConfig[T <: Data : Arithmetic, U <: Data, V <: Data](
                                                                              headerFileName: String = "gemmini_params.h"
                                                        ) {
   require(inputType.getWidth == weightType.getWidth)
+  private def isFp32(t: Data): Boolean = t match {
+    case Float(8, 24, false) => true
+    case _ => false
+  }
+  require(!has_nhwc_norm || (!has_normalizations && !has_im2col &&
+    isFp32(inputType) && isFp32(accType) &&
+    meshColumns * tileColumns == 16 && acc_read_small_width),
+    "NHWC normalization requires FP32 DIM16 and reserves CONFIG_NORM instead of integer normalization or standalone im2col")
   val sp_width = meshColumns * tileColumns * inputType.getWidth
   val sp_bank_entries = sp_capacity match {
     case CapacityInKilobytes(kb) => kb * 1024 * 8 / (sp_banks * sp_width)
@@ -516,6 +525,12 @@ case class GemminiArrayConfig[T <: Data : Arithmetic, U <: Data, V <: Data](
     if (has_normalizations) {
       header ++= "#define HAS_NORMALIZATIONS\n"
       header ++= "#define NORM_STAT_IDS 2\n\n"
+    }
+
+    if (has_nhwc_norm) {
+      header ++= "#define HAS_NHWC_NORM\n"
+      header ++= "#define NHWC_NORM_ABI_VERSION 1\n"
+      header ++= "#define NHWC_NORM_STAT_IDS 4\n\n"
     }
 
     header ++= s"#endif // $guard\n"

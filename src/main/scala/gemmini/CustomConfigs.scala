@@ -131,6 +131,22 @@ object GemminiCustomConfigs {
     headerFileName = "gemmini_params_dpvo_fp32_dim16_corr_gather.h"
   )
 
+  // Opt-in ABI: existing FP32 configurations and bitstreams stay unchanged.
+  val dpvoFP32Dim16NhwcNormConfig = dpvoFP32Dim16Config.copy(
+    has_nhwc_norm = true,
+    // CONFIG_NORM and CONFIG_IM2COL share subcommand 3. LoopConv implements
+    // its own spatial addressing and does not use this standalone unit.
+    has_im2col = false,
+    headerFileName = "gemmini_params_dpvo_fp32_dim16_nhwc_norm.h"
+  )
+
+  // Both engines share one Gemmini. The controller serializes correlation
+  // gather against the ordinary execution path, including NHWC normalization.
+  val dpvoFP32Dim16CorrGatherNhwcNormConfig = dpvoFP32Dim16NhwcNormConfig.copy(
+    has_corr_gather = true,
+    headerFileName = "gemmini_params_dpvo_fp32_dim16_corr_gather_nhwc_norm.h"
+  )
+
   val dpvoFP16Dim32Config = GemminiFPConfigs.FP16DefaultConfig.copy(
     // array
     tileRows = 1,
