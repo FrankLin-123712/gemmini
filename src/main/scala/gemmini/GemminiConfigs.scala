@@ -95,6 +95,7 @@ case class GemminiArrayConfig[T <: Data : Arithmetic, U <: Data, V <: Data](
                                                                              has_loop_conv: Boolean = true,
                                                                              has_im2col: Boolean = false,
                                                                              has_corr_gather: Boolean = false,
+                                                                             has_softagg: Boolean = false,
 
                                                                              use_firesim_simulation_counters: Boolean = false,
 
@@ -131,6 +132,10 @@ case class GemminiArrayConfig[T <: Data : Arithmetic, U <: Data, V <: Data](
     dataflow == Dataflow.WS && sp_banks == 4 && sp_bank_entries == 1024 &&
     aligned_to == 1 && dma_buswidth == 512 && dma_maxbytes == 64 &&
     !use_shared_ext_mem && !use_tl_ext_mem), "correlation gather requires the DPVO FP32 DIM16 WS configuration")
+
+  require(!has_softagg || (isFp32(inputType) && isFp32(accType) &&
+    meshColumns * tileColumns == 16 && !use_tl_ext_mem && !use_shared_ext_mem),
+    "SoftAgg requires FP32 DIM16 with internal SP/ACC banks")
 
   val local_addr_t = new LocalAddr(sp_banks, sp_bank_entries, acc_banks, acc_bank_entries)
 
@@ -361,6 +366,7 @@ case class GemminiArrayConfig[T <: Data : Arithmetic, U <: Data, V <: Data](
 
     header ++= s"#define DIM ${tileColumns*meshColumns}\n"
     header ++= s"#define ADDR_LEN 32\n"
+    header ++= s"#define HAS_SOFTAGG ${if (has_softagg) 1 else 0}\n"
     header ++= s"#define HAS_CORR_GATHER ${if (has_corr_gather) 1 else 0}\n"
     header ++= s"#define BANK_NUM $sp_banks\n"
     header ++= s"#define BANK_ROWS $sp_bank_entries\n"

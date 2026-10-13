@@ -44,6 +44,9 @@ object GemminiISA {
   val CORR_CONFIG_ORIGINS = 42.U
   val CORR_GATHER = 43.U
   val CORR_STATUS = 44.U
+  val SOFTAGG_CONFIG = 45.U
+  val SOFTAGG_RUN = 46.U
+  val SOFTAGG_STATUS = 47.U
 
   // rs1[2:0] values
   val CONFIG_EX = 0.U

@@ -244,6 +244,8 @@ class Scratchpad[T <: Data, U <: Data, V <: Data](config: GemminiArrayConfig[T, 
         val fault = Output(Bool())
       }) else None
 
+      val softagg = if (config.has_softagg) Some(Flipped(new SoftAggMemoryIO)) else None
+
       // SRAM ports
       val srams = new Bundle {
         val read = Flipped(Vec(sp_banks, new ScratchpadReadIO(sp_bank_entries, spad_w)))
@@ -582,10 +584,10 @@ class Scratchpad[T <: Data, U <: Data, V <: Data](config: GemminiArrayConfig[T, 
         }
 
         val dma_read_resp = Wire(Decoupled(new ScratchpadReadResp(spad_w)))
-        dma_read_resp.valid := bio.read.resp.valid && bio.read.resp.bits.fromDMA
+        dma_read_resp.valid := bio.read.resp.valid && bio.read.resp.bits.fromDMA && !io.softagg.map(_.active).getOrElse(false.B)
         dma_read_resp.bits := bio.read.resp.bits
         val ex_read_resp = Wire(Decoupled(new ScratchpadReadResp(spad_w)))
-        ex_read_resp.valid := bio.read.resp.valid && !bio.read.resp.bits.fromDMA
+        ex_read_resp.valid := bio.read.resp.valid && !bio.read.resp.bits.fromDMA && !io.softagg.map(_.active).getOrElse(false.B)
         ex_read_resp.bits := bio.read.resp.bits
 
         val dma_read_pipe = Module(new Queue(dma_read_resp.bits.cloneType, spad_read_delay, flow = false, pipe = true))
@@ -942,6 +944,58 @@ class Scratchpad[T <: Data, U <: Data, V <: Data](config: GemminiArrayConfig[T, 
         }
       }
       banks
+    }
+
+    // SoftAgg owns the physical bank ports only after all normal queues drain.
+    // This path bypasses normalization/scaling and never allocates DMA requests.
+    io.softagg.foreach { client =>
+      client.read.ready := false.B
+      client.response.valid := false.B
+      client.response.bits := 0.U
+      client.write.ready := false.B
+      val readAcc = client.read.bits(31)
+      val readRow = client.read.bits(30, 0)
+      val writeAcc = client.write.bits.addr(31)
+      val writeRow = client.write.bits.addr(30, 0)
+      when(client.active) {
+        for ((bank, i) <- spad_mems.zipWithIndex) {
+          val b = bank.io
+          val selectRead = !readAcc && readRow / sp_bank_entries.U === i.U
+          val selectWrite = !writeAcc && writeRow / sp_bank_entries.U === i.U
+          b.read.req.valid := client.read.valid && selectRead
+          b.read.req.bits.addr := readRow % sp_bank_entries.U
+          b.read.req.bits.fromDMA := false.B
+          io.srams.read(i).req.ready := false.B
+          when(selectRead) { client.read.ready := b.read.req.ready }
+          b.read.resp.ready := client.response.ready
+          when(b.read.resp.valid) { client.response.valid := true.B; client.response.bits := b.read.resp.bits.data }
+          b.write.valid := client.write.valid && selectWrite
+          b.write.addr := writeRow % sp_bank_entries.U
+          b.write.data := client.write.bits.data
+          b.write.mask := VecInit(Seq.fill((spad_w / (aligned_to * 8)) max 1)(true.B))
+          io.srams.write(i).ready := false.B
+          when(selectWrite) { client.write.ready := b.write.ready }
+        }
+        for ((bank, i) <- acc_mems.zipWithIndex) {
+          val b = bank.io
+          val selectRead = readAcc && readRow / acc_bank_entries.U === i.U
+          val selectWrite = writeAcc && writeRow / acc_bank_entries.U === i.U
+          b.read.req.valid := client.read.valid && selectRead
+          b.read.req.bits := 0.U.asTypeOf(b.read.req.bits)
+          b.read.req.bits.addr := readRow % acc_bank_entries.U
+          io.acc.read_req(i).ready := false.B
+          when(selectRead) { client.read.ready := b.read.req.ready }
+          b.read.resp.ready := client.response.ready
+          when(b.read.resp.valid) { client.response.valid := true.B; client.response.bits := b.read.resp.bits.data.asUInt }
+          b.write.valid := client.write.valid && selectWrite
+          b.write.bits.addr := writeRow % acc_bank_entries.U
+          b.write.bits.acc := false.B
+          b.write.bits.data := client.write.bits.data.asTypeOf(acc_row_t)
+          b.write.bits.mask := VecInit(Seq.fill(acc_w / 8)(true.B))
+          io.acc.write(i).ready := false.B
+          when(selectWrite) { client.write.ready := b.write.ready }
+        }
+      }
     }
 
     // Counter connection

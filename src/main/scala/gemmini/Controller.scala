@@ -251,14 +251,16 @@ class GemminiModule[T <: Data: Arithmetic, U <: Data, V <: Data]
   val incoming_cmd = raw_cmd_q.io.deq
   val raw_cmd = Wire(Decoupled(new GemminiCmd(reservation_station_entries)))
   raw_cmd <> incoming_cmd
+  val softaggBusy = WireInit(false.B)
   val corrBusy = WireInit(false.B)
   val corrError = WireInit(false.B)
   val corrStats = WireInit(0.U.asTypeOf(new CorrelationGatherStats))
   val corrFunct = incoming_cmd.bits.cmd.inst.funct
   val isCorr = corrFunct >= CORR_CONFIG_GEOM && corrFunct <= CORR_STATUS
+  val isSoftagg = corrFunct >= SOFTAGG_CONFIG && corrFunct <= SOFTAGG_STATUS
   val corrFlush = corrBusy && corrFunct === FLUSH_CMD
-  raw_cmd.valid := incoming_cmd.valid && !isCorr && !corrBusy
-  when (isCorr || corrBusy) { incoming_cmd.ready := false.B }
+  raw_cmd.valid := incoming_cmd.valid && !isCorr && !corrBusy && !isSoftagg && !softaggBusy
+  when (isCorr || corrBusy || isSoftagg || softaggBusy) { incoming_cmd.ready := false.B }
 
   val max_lds = reservation_station_entries_ld
   val max_exs = reservation_station_entries_ex
@@ -456,10 +458,14 @@ class GemminiModule[T <: Data: Arithmetic, U <: Data, V <: Data]
   reservation_station_completed_arb.io.out.ready := true.B
 
   // Wire up global RoCC signals
-  val normalBusy = loop_conv_unroller_busy || loop_matmul_unroller_busy ||
-    reservation_station.io.busy || spad.module.io.busy || unrolled_cmd.valid || loop_cmd.valid ||
-    conv_cmd.valid || load_controller.io.busy || store_controller.io.busy || ex_controller.io.busy
-  io.busy := incoming_cmd.valid || normalBusy || corrBusy || corrResponse.io.deq.valid
+  // Preserve the reservation station's solitary-PRELOAD fence exception.
+  // Linux may interrupt between PRELOAD and COMPUTE; its fences must return so
+  // software can submit the COMPUTE needed by ExecuteController's lookahead.
+  val roccBusy = softaggBusy || loop_conv_unroller_busy || loop_matmul_unroller_busy ||
+    reservation_station.io.busy || spad.module.io.busy || unrolled_cmd.valid || loop_cmd.valid || conv_cmd.valid
+  // Exclusive local-memory engines still require every normal controller to drain.
+  val normalBusy = roccBusy || load_controller.io.busy || store_controller.io.busy || ex_controller.io.busy
+  io.busy := incoming_cmd.valid || roccBusy || corrBusy || corrResponse.io.deq.valid
 
   // Consume the gather ABI before the loop unrollers / reservation station.
   // Do not include the held CORR command itself in normalBusy: that deadlocks.
@@ -549,6 +555,42 @@ class GemminiModule[T <: Data: Arithmetic, U <: Data, V <: Data]
       0.U -> status, 1.U -> corrStats.cycles, 2.U -> corrStats.usefulBytes,
       3.U -> corrStats.strips, 4.U -> corrStats.rows,
       5.U -> corrStats.readStall, 6.U -> corrStats.writeStall))
+  }
+
+  val softaggError = WireInit(false.B)
+  val softaggCommands = WireInit(0.U(64.W))
+  val softaggReads = WireInit(0.U(64.W))
+  val softaggWrites = WireInit(0.U(64.W))
+  val softaggFrontend = withClock(gated_clock) { Module(new SoftAggFrontend(outer.config.has_softagg)) }
+  softaggFrontend.io.command.valid := incoming_cmd.valid && isSoftagg && corrFunct =/= SOFTAGG_STATUS
+  softaggFrontend.io.command.bits.funct := corrFunct
+  softaggFrontend.io.command.bits.rs1 := incoming_cmd.bits.cmd.rs1
+  softaggFrontend.io.command.bits.rs2 := incoming_cmd.bits.cmd.rs2
+  softaggFrontend.io.blocked := normalBusy || corrBusy
+  softaggFrontend.io.fault := io.interrupt
+  softaggFrontend.io.start.ready := false.B
+  softaggError := softaggFrontend.io.error
+  when(softaggFrontend.io.command.valid) { incoming_cmd.ready := softaggFrontend.io.command.ready }
+  if (outer.config.has_softagg) {
+    require(xLen == 64, "SoftAgg ABI requires RV64")
+    val engine = withClock(gated_clock) { Module(new SoftAgg(sp_banks * sp_bank_entries,
+      acc_banks * acc_bank_entries, acc_latency + 3)) }
+    spad.module.io.softagg.get <> engine.io.memory
+    engine.io.start <> softaggFrontend.io.start
+    softaggBusy := engine.io.busy
+    softaggError := engine.io.error || softaggFrontend.io.error
+    softaggCommands := engine.io.commands
+    softaggReads := engine.io.readRows
+    softaggWrites := engine.io.writeRows
+  }
+  when(incoming_cmd.valid && corrFunct === SOFTAGG_STATUS) {
+    incoming_cmd.ready := corrResponse.io.enq.ready
+    corrResponse.io.enq.valid := true.B
+    corrResponse.io.enq.bits.rd := incoming_cmd.bits.cmd.inst.rd
+    corrResponse.io.enq.bits.data := MuxLookup(incoming_cmd.bits.cmd.rs1, 0.U)(Seq(
+      0.U -> ("h5341473100000000".U(64.W) | (outer.config.has_softagg.B.asUInt << 2) |
+        (softaggBusy.asUInt << 1) | softaggError.asUInt),
+      1.U -> softaggCommands, 2.U -> softaggReads, 3.U -> softaggWrites))
   }
 
   io.interrupt := tlb.io.exp.map(_.interrupt).reduce(_ || _)
