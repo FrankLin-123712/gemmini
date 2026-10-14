@@ -101,6 +101,7 @@ class SoftAgg(spRows: Int, accRows: Int, drainCycles: Int = 6) extends Module {
     val start = Flipped(Decoupled(new SoftAggDescriptor))
     val memory = new SoftAggMemoryIO
     val busy = Output(Bool())
+    val done = Valid(Bool()) // error; emitted only after the existing write drain
     val error = Output(Bool())
     val commands = Output(UInt(64.W))
     val readRows = Output(UInt(64.W))
@@ -110,9 +111,13 @@ class SoftAgg(spRows: Int, accRows: Int, drainCycles: Int = 6) extends Module {
   val state = RegInit(idle)
   val desc = Reg(new SoftAggDescriptor)
   val error = RegInit(false.B)
+  val done = RegInit(false.B)
   val counters = RegInit(VecInit(Seq.fill(3)(0.U(64.W))))
   io.commands := counters(0); io.readRows := counters(1); io.writeRows := counters(2)
   io.error := error
+  io.done.valid := done
+  io.done.bits := error
+  done := false.B
   io.busy := state =/= idle
   io.start.ready := state === idle
   io.memory.active := io.busy
@@ -172,6 +177,7 @@ class SoftAgg(spRows: Int, accRows: Int, drainCycles: Int = 6) extends Module {
     (d.mode === 1.U || (d.strideS =/= 0.U && !alias(d.s, d.rows, d.strideS, d.v, d.rows, d.strideV) &&
       !alias(d.s, d.rows, d.strideS, d.biasS, 1.U, 0.U) && !alias(d.s, d.rows, d.strideS, d.biasV, 1.U, 0.U)))
   when(io.start.fire) {
+    done := !legal
     error := !legal
     when(legal) {
       desc := d; edge := 0.U; chunk := 0.U; pc := 0.U; readKind := 0.U
@@ -301,6 +307,6 @@ class SoftAgg(spRows: Int, accRows: Int, drainCycles: Int = 6) extends Module {
   }
   when(state === drain) {
     drainCount := drainCount - 1.U
-    when(drainCount === 1.U) { state := idle }
+    when(drainCount === 1.U) { state := idle; done := true.B }
   }
 }

@@ -168,9 +168,14 @@ class SoftAggSpec extends AnyFlatSpec with ChiselScalatestTester {
       }
       def finish(stall: Boolean = true): Int = {
         val begin = cycle
-        while(d.io.busy.peek().litToBoolean && cycle - begin < 200000) tick(stall)
+        while(d.io.busy.peek().litToBoolean && cycle - begin < 200000) {
+          d.io.done.valid.expect(false.B)
+          tick(stall)
+        }
         assert(cycle - begin < 200000, "engine failed to drain")
         assert(pending.isEmpty)
+        d.io.done.valid.expect(true.B)
+        d.io.done.bits.expect(d.io.error.peek())
         cycle - begin
       }
       val biasS = Vector.tabulate(16)(c => (c - 7) * 0.015625f)

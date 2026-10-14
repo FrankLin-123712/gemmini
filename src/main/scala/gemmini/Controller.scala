@@ -250,17 +250,35 @@ class GemminiModule[T <: Data: Arithmetic, U <: Data, V <: Data]
 
   val incoming_cmd = raw_cmd_q.io.deq
   val raw_cmd = Wire(Decoupled(new GemminiCmd(reservation_station_entries)))
-  raw_cmd <> incoming_cmd
+  val dispatcher = withClock(gated_clock) { Module(new BranchDispatcher) }
+  dispatcher.io.command.valid := incoming_cmd.valid
+  dispatcher.io.command.bits := incoming_cmd.bits.cmd.inst.funct
+  incoming_cmd.ready := dispatcher.io.command.ready
+  raw_cmd.bits := incoming_cmd.bits
+  raw_cmd.valid := dispatcher.io.normal.valid
+  dispatcher.io.normal.ready := raw_cmd.ready
+  dispatcher.io.status.ready := corrResponse.io.enq.ready
+  dispatcher.io.abortCorr.ready := true.B
+  dispatcher.io.branches.foreach(_.ready := false.B)
+  dispatcher.io.branchCompleted.foreach { c => c.valid := false.B; c.bits := false.B }
+  dispatcher.io.fault := io.interrupt
+  // Internal trace contract, deliberately separate from the legacy status ABI.
+  // Keep job identity and timing observable in RTL simulation / FPGA debug.
+  dontTouch(dispatcher.io.accepted)
+  dontTouch(dispatcher.io.completed)
+  dontTouch(dispatcher.io.lastCompletion)
+  dontTouch(dispatcher.io.acceptedCount)
+  dontTouch(dispatcher.io.completedCount)
+  dontTouch(dispatcher.io.admissionWaitCycles)
+  dontTouch(dispatcher.io.activeCycles)
+  dontTouch(dispatcher.io.rejectedCommands)
   val softaggBusy = WireInit(false.B)
   val corrBusy = WireInit(false.B)
   val corrError = WireInit(false.B)
   val corrStats = WireInit(0.U.asTypeOf(new CorrelationGatherStats))
   val corrFunct = incoming_cmd.bits.cmd.inst.funct
-  val isCorr = corrFunct >= CORR_CONFIG_GEOM && corrFunct <= CORR_STATUS
-  val isSoftagg = corrFunct >= SOFTAGG_CONFIG && corrFunct <= SOFTAGG_STATUS
-  val corrFlush = corrBusy && corrFunct === FLUSH_CMD
-  raw_cmd.valid := incoming_cmd.valid && !isCorr && !corrBusy && !isSoftagg && !softaggBusy
-  when (isCorr || corrBusy || isSoftagg || softaggBusy) { incoming_cmd.ready := false.B }
+  dispatcher.io.branchBusy(0) := corrBusy
+  dispatcher.io.branchBusy(1) := softaggBusy
 
   val max_lds = reservation_station_entries_ld
   val max_exs = reservation_station_entries_ex
@@ -461,11 +479,12 @@ class GemminiModule[T <: Data: Arithmetic, U <: Data, V <: Data]
   // Preserve the reservation station's solitary-PRELOAD fence exception.
   // Linux may interrupt between PRELOAD and COMPUTE; its fences must return so
   // software can submit the COMPUTE needed by ExecuteController's lookahead.
-  val roccBusy = softaggBusy || loop_conv_unroller_busy || loop_matmul_unroller_busy ||
+  val roccBusy = loop_conv_unroller_busy || loop_matmul_unroller_busy ||
     reservation_station.io.busy || spad.module.io.busy || unrolled_cmd.valid || loop_cmd.valid || conv_cmd.valid
   // Exclusive local-memory engines still require every normal controller to drain.
   val normalBusy = roccBusy || load_controller.io.busy || store_controller.io.busy || ex_controller.io.busy
-  io.busy := incoming_cmd.valid || roccBusy || corrBusy || corrResponse.io.deq.valid
+  dispatcher.io.normalBusy := normalBusy
+  io.busy := incoming_cmd.valid || roccBusy || dispatcher.io.busy || corrResponse.io.deq.valid
 
   // Consume the gather ABI before the loop unrollers / reservation station.
   // Do not include the held CORR command itself in normalBusy: that deadlocks.
@@ -476,11 +495,13 @@ class GemminiModule[T <: Data: Arithmetic, U <: Data, V <: Data]
     }
     val descriptor = RegInit(0.U.asTypeOf(engine.io.start.bits))
     val configured = RegInit(0.U(3.W))
+    val frontendError = RegInit(false.B)
     val memoryStatus = Reg(new freechips.rocketchip.rocket.MStatus)
     val aborting = RegInit(false.B)
     val c = spad.module.io.corr.get
     corrBusy := engine.io.busy
-    corrError := engine.io.error
+    corrError := engine.io.error || frontendError
+    dispatcher.io.branchCompleted(0) := engine.io.done
     corrStats := engine.io.stats
     c.active := engine.io.busy
     c.cancel := aborting && engine.io.busy
@@ -493,7 +514,7 @@ class GemminiModule[T <: Data: Arithmetic, U <: Data, V <: Data]
     when (!engine.io.busy) { aborting := false.B }
     when (engine.io.busy && (c.fault || io.interrupt)) { aborting := true.B }
 
-    engine.io.start.valid := incoming_cmd.valid && corrFunct === CORR_GATHER && !normalBusy
+    engine.io.start.valid := dispatcher.io.branches(0).valid && corrFunct === CORR_GATHER && !io.interrupt
     engine.io.start.bits := descriptor
     engine.io.start.bits.bBase := incoming_cmd.bits.cmd.rs1
     // Reserved bits, an oversized local address, or incomplete configuration
@@ -502,9 +523,8 @@ class GemminiModule[T <: Data: Arithmetic, U <: Data, V <: Data]
       (incoming_cmd.bits.cmd.rs1 >> log2Ceil(sp_banks * sp_bank_entries)) =/= 0.U) {
       engine.io.start.bits.heights(0) := 0.U
     }
-    when (incoming_cmd.valid && isCorr && corrFunct =/= CORR_STATUS && !engine.io.busy && !normalBusy) {
-      incoming_cmd.ready := Mux(corrFunct === CORR_GATHER, engine.io.start.ready, true.B)
-      when (incoming_cmd.fire) {
+    dispatcher.io.branches(0).ready := io.interrupt || Mux(corrFunct === CORR_GATHER, engine.io.start.ready, true.B)
+    when (dispatcher.io.branches(0).fire && !io.interrupt) {
         switch (corrFunct) {
           is (CORR_CONFIG_GEOM) {
             descriptor.widths(0) := incoming_cmd.bits.cmd.rs1(31, 0)
@@ -525,28 +545,31 @@ class GemminiModule[T <: Data: Arithmetic, U <: Data, V <: Data]
             descriptor.originY(1) := incoming_cmd.bits.cmd.rs2(63, 32).asSInt
             configured := configured | 4.U
           }
-          is (CORR_GATHER) { memoryStatus := incoming_cmd.bits.cmd.status }
+          is (CORR_GATHER) { memoryStatus := incoming_cmd.bits.cmd.status; frontendError := false.B }
         }
-      }
     }
+    // Reject queued descriptors on a normal-path fault so its recovery FLUSH
+    // cannot be trapped behind a branch waiting for that path to drain.
+    when(io.interrupt) { configured := 0.U; frontendError := true.B }
     // Flush cannot sit behind a busy gather in the unroller. Both variants abort
     // this partial B, drain the reader, and require software to resubmit the job.
-    when (incoming_cmd.valid && corrFlush) {
-      incoming_cmd.ready := true.B
+    when (dispatcher.io.abortCorr.fire) {
       aborting := true.B
-      tlb.io.exp.foreach(_.flush_skip := incoming_cmd.bits.cmd.rs1(0))
-      tlb.io.exp.foreach(_.flush_retry := !incoming_cmd.bits.cmd.rs1(0))
     }
   } else {
     val unsupported = RegInit(false.B)
     corrError := unsupported
-    when (incoming_cmd.valid && isCorr && corrFunct =/= CORR_STATUS && !normalBusy) {
-      incoming_cmd.ready := true.B
-      unsupported := true.B
-    }
+    dispatcher.io.branches(0).ready := true.B
+    when (dispatcher.io.branches(0).fire) { unsupported := true.B }
+    dispatcher.io.branchCompleted(0).valid := RegNext(dispatcher.io.branches(0).fire &&
+      corrFunct === CORR_GATHER && !io.interrupt, false.B)
+    dispatcher.io.branchCompleted(0).bits := true.B
   }
-  when (incoming_cmd.valid && corrFunct === CORR_STATUS) {
-    incoming_cmd.ready := corrResponse.io.enq.ready
+  when(dispatcher.io.abortCorr.fire) {
+    tlb.io.exp.foreach(_.flush_skip := incoming_cmd.bits.cmd.rs1(0))
+    tlb.io.exp.foreach(_.flush_retry := !incoming_cmd.bits.cmd.rs1(0))
+  }
+  when (dispatcher.io.status.valid && corrFunct === CORR_STATUS) {
     corrResponse.io.enq.valid := true.B
     corrResponse.io.enq.bits.rd := incoming_cmd.bits.cmd.inst.rd
     val status = "h4347523100000000".U(64.W) |
@@ -562,15 +585,15 @@ class GemminiModule[T <: Data: Arithmetic, U <: Data, V <: Data]
   val softaggReads = WireInit(0.U(64.W))
   val softaggWrites = WireInit(0.U(64.W))
   val softaggFrontend = withClock(gated_clock) { Module(new SoftAggFrontend(outer.config.has_softagg)) }
-  softaggFrontend.io.command.valid := incoming_cmd.valid && isSoftagg && corrFunct =/= SOFTAGG_STATUS
+  softaggFrontend.io.command.valid := dispatcher.io.branches(1).valid
   softaggFrontend.io.command.bits.funct := corrFunct
   softaggFrontend.io.command.bits.rs1 := incoming_cmd.bits.cmd.rs1
   softaggFrontend.io.command.bits.rs2 := incoming_cmd.bits.cmd.rs2
-  softaggFrontend.io.blocked := normalBusy || corrBusy
+  softaggFrontend.io.blocked := false.B // admission and ownership belong to the dispatcher
   softaggFrontend.io.fault := io.interrupt
   softaggFrontend.io.start.ready := false.B
   softaggError := softaggFrontend.io.error
-  when(softaggFrontend.io.command.valid) { incoming_cmd.ready := softaggFrontend.io.command.ready }
+  dispatcher.io.branches(1).ready := softaggFrontend.io.command.ready
   if (outer.config.has_softagg) {
     require(xLen == 64, "SoftAgg ABI requires RV64")
     val engine = withClock(gated_clock) { Module(new SoftAgg(sp_banks * sp_bank_entries,
@@ -578,13 +601,17 @@ class GemminiModule[T <: Data: Arithmetic, U <: Data, V <: Data]
     spad.module.io.softagg.get <> engine.io.memory
     engine.io.start <> softaggFrontend.io.start
     softaggBusy := engine.io.busy
+    dispatcher.io.branchCompleted(1) := engine.io.done
     softaggError := engine.io.error || softaggFrontend.io.error
     softaggCommands := engine.io.commands
     softaggReads := engine.io.readRows
     softaggWrites := engine.io.writeRows
+  } else {
+    dispatcher.io.branchCompleted(1).valid := RegNext(dispatcher.io.branches(1).fire &&
+      corrFunct === SOFTAGG_RUN && !io.interrupt, false.B)
+    dispatcher.io.branchCompleted(1).bits := true.B
   }
-  when(incoming_cmd.valid && corrFunct === SOFTAGG_STATUS) {
-    incoming_cmd.ready := corrResponse.io.enq.ready
+  when(dispatcher.io.status.valid && corrFunct === SOFTAGG_STATUS) {
     corrResponse.io.enq.valid := true.B
     corrResponse.io.enq.bits.rd := incoming_cmd.bits.cmd.inst.rd
     corrResponse.io.enq.bits.data := MuxLookup(incoming_cmd.bits.cmd.rs1, 0.U)(Seq(
